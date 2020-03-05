@@ -12,3 +12,5 @@ Prints the debug information about memory pool used by DPDK \fIinterface\fR.
 If called without arguments, information of all the available mempools will
 be printed. For additional mempool statistics enable
 \fBCONFIG_RTE_LIBRTE_MEMPOOL_DEBUG\fR while building DPDK.
+.IP "\fBnetdev-dpdk/set-mac\fR \fIinterface\fR \fIMAC\fR"
+Change the \fIMAC\fR address of the DPDK \fIinterface\fR.

@@ -3862,6 +3862,54 @@ out:
     netdev_close(netdev);
 }
 
+static void
+netdev_dpdk_set_mac(struct unixctl_conn *conn, int argc, const char *argv[],
+                    void *aux OVS_UNUSED)
+{
+    struct netdev *netdev = NULL;
+    struct eth_addr mac;
+    char *errmsg = NULL;
+    int error;
+
+    netdev = netdev_from_name(argv[1]);
+    if (netdev == NULL) {
+        unixctl_command_reply_error(conn, "No such interface.");
+        goto out;
+    }
+
+    if (is_dpdk_class(netdev->netdev_class) == false) {
+        unixctl_command_reply_error(conn, "Not a DPDK interface.");
+        goto out;
+    }
+
+    if (argc < 2) {
+        /* Impossible to reach currently, check added for safety. */
+        unixctl_command_reply_error(conn, "Malformed command.");
+        goto out;
+    }
+
+    if (!eth_addr_from_string(argv[2], &mac)) {
+        errmsg = xasprintf("Malformed MAC address '%s'.", argv[2]);
+        unixctl_command_reply_error(conn, errmsg);
+        free(errmsg);
+        goto out;
+    }
+
+    error = netdev_dpdk_set_etheraddr(netdev, mac);
+    if (error) {
+        errmsg = xasprintf("Interface %s: setting MAC failed (%s)",
+                           netdev->name, ovs_strerror(error));
+        unixctl_command_reply_error(conn, errmsg);
+        free(errmsg);
+        goto out;
+    }
+
+    unixctl_command_reply(conn, "set-mac done");
+
+out:
+    netdev_close(netdev);
+}
+
 /*
  * Set virtqueue flags so that we do not receive interrupts.
  */
@@ -4200,6 +4248,10 @@ netdev_dpdk_class_init(void)
         unixctl_command_register("netdev-dpdk/get-mempool-info",
                                  "[netdev]", 0, 1,
                                  netdev_dpdk_get_mempool_info, NULL);
+
+        unixctl_command_register("netdev-dpdk/set-mac",
+                                 "[netdev] [mac]", 2, 2,
+                                 netdev_dpdk_set_mac, NULL);
 
         ret = rte_eth_dev_callback_register(RTE_ETH_ALL,
                                             RTE_ETH_EVENT_INTR_RESET,
