@@ -44,7 +44,7 @@ static struct vlog_rate_limit rl = VLOG_RATE_LIMIT_INIT(100, 5);
  *    'netdev' is forbidden.
  *
  * For current implementation all above restrictions could be fulfilled by
- * taking the datapath 'port_mutex' in lib/dpif-netdev.c.  */
+ * taking the datapath 'port_rwlock' in lib/dpif-netdev.c.  */
 
 /* Protects 'ufid_to_rte_flow' write access. */
 static struct ovs_mutex ufid_to_rte_flow_mutex = OVS_MUTEX_INITIALIZER;
