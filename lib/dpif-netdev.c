@@ -435,12 +435,14 @@ struct dp_flow_offload_item {
 struct dp_flow_offload {
     struct ovs_mutex mutex;
     struct ovs_list list;
+    uint64_t enqueued_item;
     pthread_cond_t cond;
 };
 
 static struct dp_flow_offload dp_flow_offload = {
     .mutex = OVS_MUTEX_INITIALIZER,
     .list  = OVS_LIST_INITIALIZER(&dp_flow_offload.list),
+    .enqueued_item = 0,
 };
 
 static struct ovsthread_once offload_thread_once
@@ -2626,6 +2628,7 @@ static void
 dp_netdev_append_flow_offload(struct dp_flow_offload_item *offload)
 {
     ovs_mutex_lock(&dp_flow_offload.mutex);
+    dp_flow_offload.enqueued_item++;
     ovs_list_push_back(&dp_flow_offload.list, &offload->node);
     xpthread_cond_signal(&dp_flow_offload.cond);
     ovs_mutex_unlock(&dp_flow_offload.mutex);
@@ -2742,6 +2745,7 @@ dp_netdev_flow_offload_main(void *data OVS_UNUSED)
                                 &dp_flow_offload.mutex);
             ovsrcu_quiesce_end();
         }
+        dp_flow_offload.enqueued_item--;
         list = ovs_list_pop_front(&dp_flow_offload.list);
         offload = CONTAINER_OF(list, struct dp_flow_offload_item, node);
         ovs_mutex_unlock(&dp_flow_offload.mutex);
@@ -4195,6 +4199,44 @@ dpif_netdev_operate(struct dpif *dpif, struct dpif_op **ops, size_t n_ops,
             break;
         }
     }
+}
+
+static int
+dpif_netdev_offload_stats_get(struct dpif *dpif,
+        struct dpif_offload_stats *stats, size_t *n_stats)
+{
+    struct dp_netdev *dp = get_dp_netdev(dpif);
+    struct dp_netdev_port *port;
+    uint64_t nb_offloads;
+
+    if (!netdev_is_flow_api_enabled()) {
+        return EINVAL;
+    }
+
+    *n_stats = 2;
+
+    if (stats == NULL)
+        return 0;
+
+    nb_offloads = 0;
+
+    ovs_mutex_lock(&dp->port_mutex);
+    HMAP_FOR_EACH (port, node, &dp->ports) {
+        uint64_t port_nb_offloads = 0;
+
+        /* Do not abort on read error from a port, just report 0. */
+        ignore (netdev_hw_offload_stats_get(port->netdev, &port_nb_offloads));
+        nb_offloads += port_nb_offloads;
+    }
+    ovs_mutex_unlock(&dp->port_mutex);
+
+    ovs_strlcpy(stats[0].name, "In-flight offloads", sizeof stats[0].name);
+    stats[0].count = dp_flow_offload.enqueued_item;
+
+    ovs_strlcpy(stats[1].name, " Inserted offloads", sizeof stats[1].name);
+    stats[1].count = nb_offloads;
+
+    return 0;
 }
 
 /* Enable or Disable PMD auto load balancing. */
@@ -8414,7 +8456,7 @@ const struct dpif_class dpif_netdev_class = {
     dpif_netdev_flow_dump_thread_destroy,
     dpif_netdev_flow_dump_next,
     dpif_netdev_operate,
-    NULL,                       /* offload_stats_get */
+    dpif_netdev_offload_stats_get,
     NULL,                       /* recv_set */
     NULL,                       /* handlers_set */
     dpif_netdev_set_config,
