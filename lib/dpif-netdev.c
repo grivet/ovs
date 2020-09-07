@@ -437,10 +437,14 @@ struct dp_offload_thread_item {
 struct dp_offload_thread {
     struct mpsc_queue queue;
     atomic_uint64_t enqueued_item;
+    struct cmap megaflow_to_mark;
+    struct cmap mark_to_flow;
 };
 
 static struct dp_offload_thread dp_offload_thread = {
     .queue  = MPSC_QUEUE_INITIALIZER(&dp_offload_thread.queue),
+    .megaflow_to_mark = CMAP_INITIALIZER,
+    .mark_to_flow = CMAP_INITIALIZER,
     .enqueued_item = ATOMIC_VAR_INIT(0),
 };
 
@@ -2403,16 +2407,7 @@ struct megaflow_to_mark_data {
     uint32_t mark;
 };
 
-struct flow_mark {
-    struct cmap megaflow_to_mark;
-    struct cmap mark_to_flow;
-    struct seq_pool *pool;
-};
-
-static struct flow_mark flow_mark = {
-    .megaflow_to_mark = CMAP_INITIALIZER,
-    .mark_to_flow = CMAP_INITIALIZER,
-};
+struct seq_pool *flow_mark_pool;
 
 static uint32_t
 flow_mark_alloc(void)
@@ -2423,12 +2418,12 @@ flow_mark_alloc(void)
 
     if (ovsthread_once_start(&pool_init)) {
         /* Haven't initiated yet, do it here */
-        flow_mark.pool = seq_pool_create(netdev_offload_thread_nb(),
+        flow_mark_pool = seq_pool_create(netdev_offload_thread_nb(),
                                          1, MAX_FLOW_MARK);
         ovsthread_once_done(&pool_init);
     }
 
-    if (seq_pool_new_id(flow_mark.pool, tid, &mark)) {
+    if (seq_pool_new_id(flow_mark_pool, tid, &mark)) {
         return mark;
     }
 
@@ -2440,7 +2435,7 @@ flow_mark_free(uint32_t mark)
 {
     unsigned int tid = netdev_offload_thread_id();
 
-    seq_pool_free_id(flow_mark.pool, tid, mark);
+    seq_pool_free_id(flow_mark_pool, tid, mark);
 }
 
 /* associate megaflow with a mark, which is a 1:1 mapping */
@@ -2453,7 +2448,7 @@ megaflow_to_mark_associate(const ovs_u128 *mega_ufid, uint32_t mark)
     data->mega_ufid = *mega_ufid;
     data->mark = mark;
 
-    cmap_insert(&flow_mark.megaflow_to_mark,
+    cmap_insert(&dp_offload_thread.megaflow_to_mark,
                 CONST_CAST(struct cmap_node *, &data->node), hash);
 }
 
@@ -2464,9 +2459,9 @@ megaflow_to_mark_disassociate(const ovs_u128 *mega_ufid)
     size_t hash = dp_netdev_flow_hash(mega_ufid);
     struct megaflow_to_mark_data *data;
 
-    CMAP_FOR_EACH_WITH_HASH (data, node, hash, &flow_mark.megaflow_to_mark) {
+    CMAP_FOR_EACH_WITH_HASH (data, node, hash, &dp_offload_thread.megaflow_to_mark) {
         if (ovs_u128_equals(*mega_ufid, data->mega_ufid)) {
-            cmap_remove(&flow_mark.megaflow_to_mark,
+            cmap_remove(&dp_offload_thread.megaflow_to_mark,
                         CONST_CAST(struct cmap_node *, &data->node), hash);
             ovsrcu_postpone(free, data);
             return;
@@ -2483,7 +2478,7 @@ megaflow_to_mark_find(const ovs_u128 *mega_ufid)
     size_t hash = dp_netdev_flow_hash(mega_ufid);
     struct megaflow_to_mark_data *data;
 
-    CMAP_FOR_EACH_WITH_HASH (data, node, hash, &flow_mark.megaflow_to_mark) {
+    CMAP_FOR_EACH_WITH_HASH (data, node, hash, &dp_offload_thread.megaflow_to_mark) {
         if (ovs_u128_equals(*mega_ufid, data->mega_ufid)) {
             return data->mark;
         }
@@ -2500,7 +2495,7 @@ mark_to_flow_associate(const uint32_t mark, struct dp_netdev_flow *flow)
 {
     dp_netdev_flow_ref(flow);
 
-    cmap_insert(&flow_mark.mark_to_flow,
+    cmap_insert(&dp_offload_thread.mark_to_flow,
                 CONST_CAST(struct cmap_node *, &flow->mark_node),
                 hash_int(mark, 0));
     flow->mark = mark;
@@ -2515,7 +2510,7 @@ flow_mark_has_no_ref(uint32_t mark)
     struct dp_netdev_flow *flow;
 
     CMAP_FOR_EACH_WITH_HASH (flow, mark_node, hash_int(mark, 0),
-                             &flow_mark.mark_to_flow) {
+                             &dp_offload_thread.mark_to_flow) {
         if (flow->mark == mark) {
             return false;
         }
@@ -2540,7 +2535,7 @@ mark_to_flow_disassociate(struct dp_netdev_pmd_thread *pmd,
         return EINVAL;
     }
 
-    cmap_remove(&flow_mark.mark_to_flow, mark_node, hash_int(mark, 0));
+    cmap_remove(&dp_offload_thread.mark_to_flow, mark_node, hash_int(mark, 0));
     flow->mark = INVALID_FLOW_MARK;
 
     /*
@@ -2577,7 +2572,7 @@ flow_mark_flush(struct dp_netdev_pmd_thread *pmd)
 {
     struct dp_netdev_flow *flow;
 
-    CMAP_FOR_EACH (flow, mark_node, &flow_mark.mark_to_flow) {
+    CMAP_FOR_EACH (flow, mark_node, &dp_offload_thread.mark_to_flow) {
         if (flow->pmd_id == pmd->core_id) {
             queue_netdev_flow_del(pmd, flow);
         }
@@ -2590,8 +2585,7 @@ mark_to_flow_find(const struct dp_netdev_pmd_thread *pmd,
 {
     struct dp_netdev_flow *flow;
 
-    CMAP_FOR_EACH_WITH_HASH (flow, mark_node, hash_int(mark, 0),
-                             &flow_mark.mark_to_flow) {
+    CMAP_FOR_EACH_WITH_HASH (flow, mark_node, hash_int(mark, 0), &dp_offload_thread.mark_to_flow) {
         if (flow->mark == mark && flow->pmd_id == pmd->core_id &&
             flow->dead == false) {
             return flow;
