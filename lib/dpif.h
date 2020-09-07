@@ -785,6 +785,25 @@ struct dpif_op {
 
 void dpif_operate(struct dpif *, struct dpif_op **ops, size_t n_ops,
                   enum dpif_offload_type);
+
+struct dpif_offload_stats {
+    char name[100];
+    uint64_t count;
+};
+
+/* Queries the dpif for hardware offloads statistics.
+ *
+ * On success, statistics for the dataplane are written in 'stats' if it is
+ * not NULL.  In all cases the number of 'stats' elements that could be
+ * written are written to 'n_stats'.
+ *
+ * Memory must be managed by the caller.
+ *
+ * First call with 'stats' NULL to know how many elements to allocate, then
+ * call a second time to get the result.
+ */
+int dpif_offload_stats_get(struct dpif *dpif, struct dpif_offload_stats *stats,
+                           size_t *n_stats);
 
 /* Upcalls. */
 
