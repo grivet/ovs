@@ -2620,13 +2620,19 @@ dp_netdev_alloc_flow_offload(struct dp_netdev_pmd_thread *pmd,
 }
 
 static void
-dp_netdev_free_flow_offload(struct dp_offload_thread_item *offload)
+dp_netdev_flow_offload_free(struct dp_offload_thread_item *offload)
+{
+    free(offload->actions);
+    free(offload);
+}
+
+static void
+dp_netdev_flow_offload_unref(struct dp_offload_thread_item *offload)
 {
     dp_netdev_pmd_unref(offload->pmd);
     dp_netdev_flow_unref(offload->flow);
 
-    free(offload->actions);
-    free(offload);
+    ovsrcu_postpone(dp_netdev_flow_offload_free, offload);
 }
 
 static void
@@ -2794,7 +2800,7 @@ dp_netdev_flow_offload_main(void *data OVS_UNUSED)
                      ret == 0 ? "succeed" : "failed", op,
                      UUID_ARGS((struct uuid *) &offload->flow->mega_ufid));
 
-            dp_netdev_free_flow_offload(offload);
+            dp_netdev_flow_offload_unref(offload);
 
             /* Do RCU synchronization at fixed interval. */
             if (time_msec() > next_rcu_quiesce) {
