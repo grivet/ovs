@@ -5190,47 +5190,29 @@ out:
 }
 
 int
-netdev_dpdk_rte_flow_destroy(struct netdev *netdev,
-                             struct rte_flow *rte_flow,
-                             struct rte_flow_error *error)
+netdev_dpdk_rte_flow_destroy(OVS_UNUSED struct netdev *netdev,
+                             OVS_UNUSED struct rte_flow *rte_flow,
+                             OVS_UNUSED struct rte_flow_error *error)
 {
     struct netdev_dpdk *dev = netdev_dpdk_cast(netdev);
-    int ret;
+    unsigned int tid = netdev_offload_thread_id();
 
-    ovs_mutex_lock(&dev->mutex);
-    ret = rte_flow_destroy(dev->port_id, rte_flow, error);
-    ovs_mutex_unlock(&dev->mutex);
-
-    if (!ret) {
-        unsigned int tid = netdev_offload_thread_id();
-
-        dev->sw_stats->hw_offloads[tid]--;
-    }
-
-    return ret;
+    dev->sw_stats->hw_offloads[tid]--;
+    return 0;
 }
 
 struct rte_flow *
-netdev_dpdk_rte_flow_create(struct netdev *netdev,
-                            const struct rte_flow_attr *attr,
-                            const struct rte_flow_item *items,
-                            const struct rte_flow_action *actions,
-                            struct rte_flow_error *error)
+netdev_dpdk_rte_flow_create(OVS_UNUSED struct netdev *netdev,
+                            OVS_UNUSED const struct rte_flow_attr *attr,
+                            OVS_UNUSED const struct rte_flow_item *items,
+                            OVS_UNUSED const struct rte_flow_action *actions,
+                            OVS_UNUSED struct rte_flow_error *error)
 {
-    struct rte_flow *flow;
     struct netdev_dpdk *dev = netdev_dpdk_cast(netdev);
+    unsigned int tid = netdev_offload_thread_id();
 
-    ovs_mutex_lock(&dev->mutex);
-    flow = rte_flow_create(dev->port_id, attr, items, actions, error);
-    ovs_mutex_unlock(&dev->mutex);
-
-    if (flow) {
-        unsigned int tid = netdev_offload_thread_id();
-
-        dev->sw_stats->hw_offloads[tid]++;
-    }
-
-    return flow;
+    dev->sw_stats->hw_offloads[tid]++;
+    return (struct rte_flow *)0xdeadbeef;
 }
 
 int
