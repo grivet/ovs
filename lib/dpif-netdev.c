@@ -435,21 +435,16 @@ struct dp_offload_thread_item {
 };
 
 struct dp_offload_thread {
-    struct mpsc_queue queue;
-    atomic_uint64_t enqueued_item;
-    struct cmap megaflow_to_mark;
-    struct cmap mark_to_flow;
+    PADDED_MEMBERS(CACHE_LINE_SIZE,
+        struct mpsc_queue queue;
+        atomic_uint64_t enqueued_item;
+        struct cmap megaflow_to_mark;
+        struct cmap mark_to_flow;
+    );
 };
 
-static struct dp_offload_thread dp_offload_thread = {
-    .queue  = MPSC_QUEUE_INITIALIZER(&dp_offload_thread.queue),
-    .megaflow_to_mark = CMAP_INITIALIZER,
-    .mark_to_flow = CMAP_INITIALIZER,
-    .enqueued_item = ATOMIC_VAR_INIT(0),
-};
-
-static struct ovsthread_once offload_thread_once
-    = OVSTHREAD_ONCE_INITIALIZER;
+static struct dp_offload_thread *dp_offload_threads;
+static void *dp_netdev_flow_offload_main(void *arg);
 
 #define XPS_TIMEOUT 500000LL    /* In microseconds. */
 
@@ -2444,11 +2439,12 @@ megaflow_to_mark_associate(const ovs_u128 *mega_ufid, uint32_t mark)
 {
     size_t hash = dp_netdev_flow_hash(mega_ufid);
     struct megaflow_to_mark_data *data = xzalloc(sizeof(*data));
+    unsigned int tid = netdev_offload_thread_id();
 
     data->mega_ufid = *mega_ufid;
     data->mark = mark;
 
-    cmap_insert(&dp_offload_thread.megaflow_to_mark,
+    cmap_insert(&dp_offload_threads[tid].megaflow_to_mark,
                 CONST_CAST(struct cmap_node *, &data->node), hash);
 }
 
@@ -2458,10 +2454,12 @@ megaflow_to_mark_disassociate(const ovs_u128 *mega_ufid)
 {
     size_t hash = dp_netdev_flow_hash(mega_ufid);
     struct megaflow_to_mark_data *data;
+    unsigned int tid = netdev_offload_thread_id();
 
-    CMAP_FOR_EACH_WITH_HASH (data, node, hash, &dp_offload_thread.megaflow_to_mark) {
+    CMAP_FOR_EACH_WITH_HASH (data, node, hash,
+                             &dp_offload_threads[tid].megaflow_to_mark) {
         if (ovs_u128_equals(*mega_ufid, data->mega_ufid)) {
-            cmap_remove(&dp_offload_thread.megaflow_to_mark,
+            cmap_remove(&dp_offload_threads[tid].megaflow_to_mark,
                         CONST_CAST(struct cmap_node *, &data->node), hash);
             ovsrcu_postpone(free, data);
             return;
@@ -2477,8 +2475,10 @@ megaflow_to_mark_find(const ovs_u128 *mega_ufid)
 {
     size_t hash = dp_netdev_flow_hash(mega_ufid);
     struct megaflow_to_mark_data *data;
+    unsigned int tid = netdev_offload_thread_id();
 
-    CMAP_FOR_EACH_WITH_HASH (data, node, hash, &dp_offload_thread.megaflow_to_mark) {
+    CMAP_FOR_EACH_WITH_HASH (data, node, hash,
+                             &dp_offload_threads[tid].megaflow_to_mark) {
         if (ovs_u128_equals(*mega_ufid, data->mega_ufid)) {
             return data->mark;
         }
@@ -2493,9 +2493,11 @@ megaflow_to_mark_find(const ovs_u128 *mega_ufid)
 static void
 mark_to_flow_associate(const uint32_t mark, struct dp_netdev_flow *flow)
 {
+    unsigned int tid = netdev_offload_thread_id();
+
     dp_netdev_flow_ref(flow);
 
-    cmap_insert(&dp_offload_thread.mark_to_flow,
+    cmap_insert(&dp_offload_threads[tid].mark_to_flow,
                 CONST_CAST(struct cmap_node *, &flow->mark_node),
                 hash_int(mark, 0));
     flow->mark = mark;
@@ -2507,10 +2509,11 @@ mark_to_flow_associate(const uint32_t mark, struct dp_netdev_flow *flow)
 static bool
 flow_mark_has_no_ref(uint32_t mark)
 {
+    unsigned int tid = netdev_offload_thread_id();
     struct dp_netdev_flow *flow;
 
     CMAP_FOR_EACH_WITH_HASH (flow, mark_node, hash_int(mark, 0),
-                             &dp_offload_thread.mark_to_flow) {
+                             &dp_offload_threads[tid].mark_to_flow) {
         if (flow->mark == mark) {
             return false;
         }
@@ -2526,6 +2529,7 @@ mark_to_flow_disassociate(struct dp_netdev_pmd_thread *pmd,
     const char *dpif_type_str = dpif_normalize_type(pmd->dp->class->type);
     struct cmap_node *mark_node = CONST_CAST(struct cmap_node *,
                                              &flow->mark_node);
+    unsigned int tid = netdev_offload_thread_id();
     uint32_t mark = flow->mark;
     int ret = 0;
 
@@ -2535,7 +2539,8 @@ mark_to_flow_disassociate(struct dp_netdev_pmd_thread *pmd,
         return EINVAL;
     }
 
-    cmap_remove(&dp_offload_thread.mark_to_flow, mark_node, hash_int(mark, 0));
+    cmap_remove(&dp_offload_threads[tid].mark_to_flow,
+                mark_node, hash_int(mark, 0));
     flow->mark = INVALID_FLOW_MARK;
 
     /*
@@ -2571,10 +2576,18 @@ static void
 flow_mark_flush(struct dp_netdev_pmd_thread *pmd)
 {
     struct dp_netdev_flow *flow;
+    size_t i;
 
-    CMAP_FOR_EACH (flow, mark_node, &dp_offload_thread.mark_to_flow) {
-        if (flow->pmd_id == pmd->core_id) {
-            queue_netdev_flow_del(pmd, flow);
+    if (dp_offload_threads == NULL)
+        return;
+
+    for (i = 0; i < netdev_offload_thread_nb(); i++) {
+        struct dp_offload_thread *ofl_thread = &dp_offload_threads[i];
+
+        CMAP_FOR_EACH (flow, mark_node, &ofl_thread->mark_to_flow) {
+            if (flow->pmd_id == pmd->core_id) {
+                queue_netdev_flow_del(pmd, flow);
+            }
         }
     }
 }
@@ -2584,11 +2597,21 @@ mark_to_flow_find(const struct dp_netdev_pmd_thread *pmd,
                   const uint32_t mark)
 {
     struct dp_netdev_flow *flow;
+    size_t hash;
+    size_t i;
 
-    CMAP_FOR_EACH_WITH_HASH (flow, mark_node, hash_int(mark, 0), &dp_offload_thread.mark_to_flow) {
-        if (flow->mark == mark && flow->pmd_id == pmd->core_id &&
-            flow->dead == false) {
-            return flow;
+    if (dp_offload_threads == NULL)
+        return NULL;
+
+    hash = hash_int(mark, 0);
+    for (i = 0; i < netdev_offload_thread_nb(); i++) {
+        struct dp_offload_thread *ofl_thread = &dp_offload_threads[i];
+
+        CMAP_FOR_EACH_WITH_HASH (flow, mark_node, hash, &ofl_thread->mark_to_flow) {
+            if (flow->mark == mark && flow->pmd_id == pmd->core_id &&
+                flow->dead == false) {
+                return flow;
+            }
         }
     }
 
@@ -2630,10 +2653,35 @@ dp_netdev_flow_offload_unref(struct dp_offload_thread_item *offload)
 }
 
 static void
+dp_netdev_offload_init(void)
+{
+    static struct ovsthread_once offload_thread_start = OVSTHREAD_ONCE_INITIALIZER;
+    unsigned int nb_offload_thread = netdev_offload_thread_nb();
+    unsigned int i;
+
+    if (ovsthread_once_start(&offload_thread_start)) {
+        dp_offload_threads = xcalloc(nb_offload_thread, sizeof *dp_offload_threads);
+        for (i = 0; i < nb_offload_thread; i++) {
+            mpsc_queue_init(&dp_offload_threads[i].queue);
+            cmap_init(&dp_offload_threads[i].megaflow_to_mark);
+            cmap_init(&dp_offload_threads[i].mark_to_flow);
+            atomic_init(&dp_offload_threads[i].enqueued_item, 0);
+            ovs_thread_create("flow_offload",
+                              dp_netdev_flow_offload_main, &dp_offload_threads[i]);
+        }
+        ovsthread_once_done(&offload_thread_start);
+    }
+}
+
+static void
 dp_netdev_append_flow_offload(struct dp_offload_thread_item *offload)
 {
-    mpsc_queue_insert(&dp_offload_thread.queue, &offload->node);
-    atomic_count_inc64(&dp_offload_thread.enqueued_item);
+    unsigned int i;
+
+    dp_netdev_offload_init();
+    i = netdev_offload_ufid_to_thread_id(offload->flow->mega_ufid);
+    mpsc_queue_insert(&dp_offload_threads[i].queue, &offload->node);
+    atomic_count_inc64(&dp_offload_threads[i].enqueued_item);
 }
 
 static int
@@ -2736,8 +2784,9 @@ err_free:
 #define DP_NETDEV_OFFLOAD_QUIESCE_INTERVAL_MS 10
 
 static void *
-dp_netdev_flow_offload_main(void *data OVS_UNUSED)
+dp_netdev_flow_offload_main(void *arg)
 {
+    struct dp_offload_thread *ofl_thread = arg;
     enum mpsc_queue_poll_result poll_result;
     struct dp_offload_thread_item *offload;
     long long int next_rcu_quiesce;
@@ -2746,7 +2795,7 @@ dp_netdev_flow_offload_main(void *data OVS_UNUSED)
     const char *op;
     int ret;
 
-    queue = &dp_offload_thread.queue;
+    queue = &ofl_thread->queue;
     if (!mpsc_queue_acquire(queue)) {
         VLOG_ERR("failed to register as consumer of the offload queue.\n");
         return NULL;
@@ -2771,7 +2820,7 @@ dp_netdev_flow_offload_main(void *data OVS_UNUSED)
             }
             offload = CONTAINER_OF(node, struct dp_offload_thread_item, node);
 
-            atomic_count_dec64(&dp_offload_thread.enqueued_item);
+            atomic_count_dec64(&ofl_thread->enqueued_item);
 
             switch (offload->op) {
             case DP_NETDEV_FLOW_OFFLOAD_OP_ADD:
@@ -2815,12 +2864,6 @@ queue_netdev_flow_del(struct dp_netdev_pmd_thread *pmd,
 {
     struct dp_offload_thread_item *offload;
 
-    if (ovsthread_once_start(&offload_thread_once)) {
-        mpsc_queue_init(&dp_offload_thread.queue);
-        ovs_thread_create("flow_offload", dp_netdev_flow_offload_main, NULL);
-        ovsthread_once_done(&offload_thread_once);
-    }
-
     offload = dp_netdev_alloc_flow_offload(pmd, flow,
                                            DP_NETDEV_FLOW_OFFLOAD_OP_DEL);
     dp_netdev_append_flow_offload(offload);
@@ -2836,12 +2879,6 @@ queue_netdev_flow_put(struct dp_netdev_pmd_thread *pmd,
 
     if (!netdev_is_flow_api_enabled()) {
         return;
-    }
-
-    if (ovsthread_once_start(&offload_thread_once)) {
-        mpsc_queue_init(&dp_offload_thread.queue);
-        ovs_thread_create("flow_offload", dp_netdev_flow_offload_main, NULL);
-        ovsthread_once_done(&offload_thread_once);
     }
 
     if (flow->mark != INVALID_FLOW_MARK) {
@@ -4237,34 +4274,66 @@ dpif_netdev_offload_stats_get(struct dpif *dpif,
 {
     struct dp_netdev *dp = get_dp_netdev(dpif);
     struct dp_netdev_port *port;
-    uint64_t nb_offloads;
+    uint64_t total_inflight = 0;
+    uint64_t total_inserted = 0;
+    unsigned int nb_thread;
+    uint64_t *port_nb_offloads;
+    uint64_t *nb_offloads;
+    unsigned int i;
 
     if (!netdev_is_flow_api_enabled()) {
         return EINVAL;
     }
 
-    *n_stats = 2;
+    nb_thread = netdev_offload_thread_nb();
+
+    /* Two stats per thread, +1 for the total. */
+    *n_stats = 2 * (nb_thread + 1);
 
     if (stats == NULL)
         return 0;
 
-    nb_offloads = 0;
+    nb_offloads = xcalloc(nb_thread, sizeof *nb_offloads);
+    port_nb_offloads = xcalloc(nb_thread, sizeof *port_nb_offloads);
 
     ovs_rwlock_rdlock(&dp->port_rwlock);
     HMAP_FOR_EACH (port, node, &dp->ports) {
-        uint64_t port_nb_offloads = 0;
-
+        memset(port_nb_offloads, 0, nb_thread * sizeof *port_nb_offloads);
         /* Do not abort on read error from a port, just report 0. */
-        ignore (netdev_hw_offload_stats_get(port->netdev, &port_nb_offloads));
-        nb_offloads += port_nb_offloads;
+        ignore (netdev_hw_offload_stats_get(port->netdev, port_nb_offloads));
+        for (i = 0; i < nb_thread; i++) {
+            nb_offloads[i] += port_nb_offloads[i];
+        }
     }
     ovs_rwlock_unlock(&dp->port_rwlock);
 
-    ovs_strlcpy(stats[0].name, "In-flight offloads", sizeof stats[0].name);
-    atomic_read_relaxed(&dp_offload_thread.enqueued_item, &stats[0].count);
+    free(port_nb_offloads);
 
-    ovs_strlcpy(stats[1].name, " Inserted offloads", sizeof stats[1].name);
-    stats[1].count = nb_offloads;
+    for (i = 0; i < nb_thread; i++) {
+        uint64_t inserted = nb_offloads[i];
+        uint64_t inflight = 0;
+        size_t idx = ((i + 1) * 2);
+
+        if (dp_offload_threads != NULL) {
+            atomic_read_relaxed(&dp_offload_threads[i].enqueued_item, &inflight);
+        }
+
+        snprintf(stats[idx + 0].name, sizeof stats[idx + 0].name, "  [%3u] In-flight offloads", i);
+        snprintf(stats[idx + 1].name, sizeof stats[idx + 1].name, "  [%3u]  Inserted offloads", i);
+
+        stats[idx + 0].count = inflight;
+        stats[idx + 1].count = inserted;
+
+        total_inflight += inflight;
+        total_inserted += inserted;
+    }
+
+    free(nb_offloads);
+
+    ovs_strlcpy(stats[0].name, "  Total In-flight offloads", sizeof stats[0].name);
+    stats[0].count = total_inflight;
+    ovs_strlcpy(stats[1].name, "  Total  Inserted offloads", sizeof stats[1].name);
+    stats[1].count = total_inserted;
 
     return 0;
 }
