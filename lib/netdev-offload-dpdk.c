@@ -1589,9 +1589,9 @@ out:
 
 static int
 netdev_offload_dpdk_hw_offload_stats_get(struct netdev *netdev,
-                                         uint64_t *counter)
+                                         uint64_t *counters)
 {
-    netdev_dpdk_rte_flow_count(netdev, counter);
+    netdev_dpdk_rte_flow_count(netdev, counters);
     return 0;
 }
 

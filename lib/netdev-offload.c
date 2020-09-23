@@ -60,6 +60,12 @@ VLOG_DEFINE_THIS_MODULE(netdev_offload);
 
 static bool netdev_flow_api_enabled = false;
 
+#define DEFAULT_OFFLOAD_THREAD_NB 1
+#define MAX_OFFLOAD_THREAD_NB 10
+
+static unsigned int offload_thread_nb;
+DEFINE_EXTERN_PER_THREAD_DATA(netdev_offload_thread_id, OVSTHREAD_ID_UNSET);
+
 /* Protects 'netdev_flow_apis'.  */
 static struct ovs_mutex netdev_flow_api_provider_mutex = OVS_MUTEX_INITIALIZER;
 
@@ -281,13 +287,13 @@ netdev_flow_del(struct netdev *netdev, const ovs_u128 *ufid,
 }
 
 int
-netdev_hw_offload_stats_get(struct netdev *netdev, uint64_t *counter)
+netdev_hw_offload_stats_get(struct netdev *netdev, uint64_t *counters)
 {
     const struct netdev_flow_api *flow_api =
         ovsrcu_get(const struct netdev_flow_api *, &netdev->flow_api);
 
     return (flow_api && flow_api->hw_offload_stats_get)
-           ? flow_api->hw_offload_stats_get(netdev, counter)
+           ? flow_api->hw_offload_stats_get(netdev, counters)
            : EOPNOTSUPP;
 }
 
@@ -430,6 +436,60 @@ bool
 netdev_is_flow_api_enabled(void)
 {
     return netdev_flow_api_enabled;
+}
+
+unsigned int
+netdev_offload_thread_nb(void)
+{
+    return offload_thread_nb;
+}
+
+unsigned int
+netdev_offload_ufid_to_thread_id(const ovs_u128 ufid)
+{
+    uint32_t ufid_hash;
+
+    if (netdev_offload_thread_nb() == 1)
+        return 0;
+
+    ufid_hash = hash_words64_inline(
+            (const uint64_t [2]){ ufid.u64.lo,
+                                  ufid.u64.hi }, 2, 1);
+    return ufid_hash % netdev_offload_thread_nb();
+}
+
+unsigned int
+netdev_offload_thread_init(void)
+{
+    static atomic_count next_id = ATOMIC_COUNT_INIT(0);
+
+    /* Panic if any other thread besides offload and RCU tries
+     * to initialize their thread ID. */
+    ovs_assert(!strncmp(get_subprogram_name(), "flow_offload", 12)
+            || !strncmp(get_subprogram_name(), "urcu", 4));
+
+    if (*netdev_offload_thread_id_get() == OVSTHREAD_ID_UNSET) {
+        unsigned int id;
+
+        if (!strncmp(get_subprogram_name(), "urcu", 4)) {
+            /* If the postpone thread (urcu) is getting
+             * a thread id, then it can only do so while all other
+             * offload threads are quiescent.  It is safe to return
+             * any of those thread ids. */
+            id = 0;
+        } else {
+            /* The RCU thread should not however be allowed to
+             * supplant an actual offload thread ID if it
+             * happened to initialize its ID first.
+             */
+            id = atomic_count_inc(&next_id);
+        }
+        /* Panic if any offload thread is getting a spurious ID. */
+        ovs_assert(id < netdev_offload_thread_nb());
+        return *netdev_offload_thread_id_get() = id;
+    } else {
+        return *netdev_offload_thread_id_get();
+    }
 }
 
 void
@@ -660,7 +720,18 @@ netdev_set_flow_api_enabled(const struct smap *ovs_other_config)
         if (ovsthread_once_start(&once)) {
             netdev_flow_api_enabled = true;
 
-            VLOG_INFO("netdev: Flow API Enabled");
+            offload_thread_nb = smap_get_ullong(ovs_other_config,
+                                "hw-offload-thread-nb",
+                                DEFAULT_OFFLOAD_THREAD_NB);
+            if (offload_thread_nb > MAX_OFFLOAD_THREAD_NB) {
+                VLOG_WARN("netdev: Invalid number of threads requested: %u",
+                          offload_thread_nb);
+                offload_thread_nb = DEFAULT_OFFLOAD_THREAD_NB;
+            }
+
+            VLOG_INFO("netdev: Flow API Enabled, using %u thread%s",
+                      offload_thread_nb,
+                      offload_thread_nb > 1 ? "s" : "");
 
 #ifdef __linux__
             tc_set_policy(smap_get_def(ovs_other_config, "tc-policy",
