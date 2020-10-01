@@ -1587,10 +1587,19 @@ out:
     return ret;
 }
 
+static int
+netdev_offload_dpdk_hw_offload_stats_get(struct netdev *netdev,
+                                         uint64_t *counter)
+{
+    netdev_dpdk_rte_flow_count(netdev, counter);
+    return 0;
+}
+
 const struct netdev_flow_api netdev_offload_dpdk = {
     .type = "dpdk_flow_api",
     .flow_put = netdev_offload_dpdk_flow_put,
     .flow_del = netdev_offload_dpdk_flow_del,
     .init_flow_api = netdev_offload_dpdk_init_flow_api,
     .flow_get = netdev_offload_dpdk_flow_get,
+    .hw_offload_stats_get = netdev_offload_dpdk_hw_offload_stats_get,
 };

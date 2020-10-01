@@ -22,6 +22,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <stdint.h>
 #include <linux/virtio_net.h>
 #include <sys/socket.h>
 #include <linux/if.h>
@@ -210,6 +211,8 @@ struct netdev_dpdk_sw_stats {
     uint64_t tx_qos_drops;
     /* Packet drops in ingress policer processing. */
     uint64_t rx_qos_drops;
+    /* Number of inserted HW offloads. */
+    uint64_t hw_offloads;
     /* Packet drops in HWOL processing. */
     uint64_t tx_invalid_hwol_drops;
 };
@@ -5194,6 +5197,11 @@ netdev_dpdk_rte_flow_destroy(struct netdev *netdev,
     ovs_mutex_lock(&dev->mutex);
     ret = rte_flow_destroy(dev->port_id, rte_flow, error);
     ovs_mutex_unlock(&dev->mutex);
+
+    if (!ret) {
+        dev->sw_stats->hw_offloads--;
+    }
+
     return ret;
 }
 
@@ -5210,6 +5218,11 @@ netdev_dpdk_rte_flow_create(struct netdev *netdev,
     ovs_mutex_lock(&dev->mutex);
     flow = rte_flow_create(dev->port_id, attr, items, actions, error);
     ovs_mutex_unlock(&dev->mutex);
+
+    if (flow) {
+        dev->sw_stats->hw_offloads++;
+    }
+
     return flow;
 }
 
@@ -5241,6 +5254,14 @@ netdev_dpdk_rte_flow_query_count(struct netdev *netdev,
     ret = rte_flow_query(dev->port_id, rte_flow, actions, query, error);
     ovs_mutex_unlock(&dev->mutex);
     return ret;
+}
+
+void
+netdev_dpdk_rte_flow_count(struct netdev *netdev, uint64_t *out)
+{
+    struct netdev_dpdk *dev = netdev_dpdk_cast(netdev);
+
+    *out = dev->sw_stats->hw_offloads;
 }
 
 #define NETDEV_DPDK_CLASS_COMMON                            \

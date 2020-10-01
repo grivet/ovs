@@ -18,6 +18,7 @@
 #define NETDEV_DPDK_H
 
 #include <config.h>
+#include <stdint.h>
 
 #include "openvswitch/compiler.h"
 
@@ -53,6 +54,8 @@ netdev_dpdk_rte_flow_query_count(struct netdev *netdev,
                                  struct rte_flow *rte_flow,
                                  struct rte_flow_query_count *query,
                                  struct rte_flow_error *error);
+void
+netdev_dpdk_rte_flow_count(struct netdev *netdev, uint64_t *out);
 int
 netdev_dpdk_get_port_id(struct netdev *netdev);
 
