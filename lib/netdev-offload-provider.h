@@ -83,6 +83,9 @@ struct netdev_flow_api {
     int (*flow_del)(struct netdev *, const ovs_u128 *ufid,
                     struct dpif_flow_stats *);
 
+    /* Queries an offload provider hardware statistics. */
+    int (*hw_offload_stats_get)(struct netdev *netdev, uint64_t *counter);
+
     /* Initializies the netdev flow api.
      * Return 0 if successful, otherwise returns a positive errno value. */
     int (*init_flow_api)(struct netdev *);
