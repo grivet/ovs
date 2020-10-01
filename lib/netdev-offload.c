@@ -281,6 +281,17 @@ netdev_flow_del(struct netdev *netdev, const ovs_u128 *ufid,
 }
 
 int
+netdev_hw_offload_stats_get(struct netdev *netdev, uint64_t *counter)
+{
+    const struct netdev_flow_api *flow_api =
+        ovsrcu_get(const struct netdev_flow_api *, &netdev->flow_api);
+
+    return (flow_api && flow_api->hw_offload_stats_get)
+           ? flow_api->hw_offload_stats_get(netdev, counter)
+           : EOPNOTSUPP;
+}
+
+int
 netdev_init_flow_api(struct netdev *netdev)
 {
     if (!netdev_is_flow_api_enabled()) {
