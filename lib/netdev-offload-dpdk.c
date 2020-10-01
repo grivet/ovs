@@ -63,6 +63,7 @@ struct ufid_to_rte_flow_data {
 
 struct netdev_offload_dpdk_data {
     struct cmap ufid_to_rte_flow;
+    uint64_t rte_flow_counter;
 };
 
 static int
@@ -618,6 +619,10 @@ netdev_offload_dpdk_flow_create(struct netdev *netdev,
 
     flow = netdev_dpdk_rte_flow_create(netdev, attr, items, actions, error);
     if (flow) {
+        struct netdev_offload_dpdk_data *data;
+
+        data = netdev->hw_info.offload_data;
+        data->rte_flow_counter++;
         if (!VLOG_DROP_DBG(&rl)) {
             dump_flow(&s, &s_extra, attr, items, actions);
             extra_str = ds_cstr(&s_extra);
@@ -1504,6 +1509,11 @@ netdev_offload_dpdk_destroy_flow(struct netdev *netdev,
     int ret = netdev_dpdk_rte_flow_destroy(netdev, rte_flow, &error);
 
     if (ret == 0) {
+        struct netdev_offload_dpdk_data *data;
+
+        data = netdev->hw_info.offload_data;
+        data->rte_flow_counter--;
+
         ufid_to_rte_flow_disassociate(netdev, ufid);
         VLOG_DBG_RL(&rl, "%s: rte_flow 0x%"PRIxPTR
                     " flow destroy %d ufid " UUID_FMT,
@@ -1644,6 +1654,17 @@ out:
     return ret;
 }
 
+static int
+netdev_offload_dpdk_hw_offload_stats_get(struct netdev *netdev,
+                                         uint64_t *counter)
+{
+    struct netdev_offload_dpdk_data *data;
+
+    data = netdev->hw_info.offload_data;
+    *counter = data->rte_flow_counter;
+    return 0;
+}
+
 const struct netdev_flow_api netdev_offload_dpdk = {
     .type = "dpdk_flow_api",
     .flow_put = netdev_offload_dpdk_flow_put,
@@ -1651,4 +1672,5 @@ const struct netdev_flow_api netdev_offload_dpdk = {
     .init_flow_api = netdev_offload_dpdk_init_flow_api,
     .deinit_flow_api = netdev_offload_dpdk_deinit_flow_api,
     .flow_get = netdev_offload_dpdk_flow_get,
+    .hw_offload_stats_get = netdev_offload_dpdk_hw_offload_stats_get,
 };
