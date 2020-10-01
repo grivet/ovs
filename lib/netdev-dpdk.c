@@ -212,7 +212,7 @@ struct netdev_dpdk_sw_stats {
     /* Packet drops in ingress policer processing. */
     uint64_t rx_qos_drops;
     /* Number of inserted HW offloads. */
-    uint64_t hw_offloads;
+    uint64_t *hw_offloads;
     /* Packet drops in HWOL processing. */
     uint64_t tx_invalid_hwol_drops;
 };
@@ -1283,6 +1283,8 @@ common_construct(struct netdev *netdev, dpdk_port_t port_no,
     dev->rte_xstats_ids_size = 0;
 
     dev->sw_stats = xzalloc(sizeof *dev->sw_stats);
+    dev->sw_stats->hw_offloads = xcalloc(netdev_offload_thread_nb(),
+                                         sizeof *dev->sw_stats->hw_offloads);
     dev->sw_stats->tx_retries = (dev->type == DPDK_DEV_VHOST) ? 0 : UINT64_MAX;
 
     return 0;
@@ -1453,6 +1455,7 @@ common_destruct(struct netdev_dpdk *dev)
     ovs_list_remove(&dev->list_node);
     free(ovsrcu_get_protected(struct ingress_policer *,
                               &dev->ingress_policer));
+    free(dev->sw_stats->hw_offloads);
     free(dev->sw_stats);
     ovs_mutex_destroy(&dev->mutex);
 }
@@ -5199,7 +5202,9 @@ netdev_dpdk_rte_flow_destroy(struct netdev *netdev,
     ovs_mutex_unlock(&dev->mutex);
 
     if (!ret) {
-        dev->sw_stats->hw_offloads--;
+        unsigned int tid = netdev_offload_thread_id();
+
+        dev->sw_stats->hw_offloads[tid]--;
     }
 
     return ret;
@@ -5220,7 +5225,9 @@ netdev_dpdk_rte_flow_create(struct netdev *netdev,
     ovs_mutex_unlock(&dev->mutex);
 
     if (flow) {
-        dev->sw_stats->hw_offloads++;
+        unsigned int tid = netdev_offload_thread_id();
+
+        dev->sw_stats->hw_offloads[tid]++;
     }
 
     return flow;
@@ -5260,8 +5267,11 @@ void
 netdev_dpdk_rte_flow_count(struct netdev *netdev, uint64_t *out)
 {
     struct netdev_dpdk *dev = netdev_dpdk_cast(netdev);
+    unsigned int tid;
 
-    *out = dev->sw_stats->hw_offloads;
+    for (tid = 0; tid < netdev_offload_thread_nb(); tid++) {
+        out[tid] = dev->sw_stats->hw_offloads[tid];
+    }
 }
 
 #define NETDEV_DPDK_CLASS_COMMON                            \
