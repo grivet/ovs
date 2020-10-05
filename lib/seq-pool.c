@@ -20,6 +20,7 @@
 #include "openvswitch/thread.h"
 #include "openvswitch/util.h"
 #include "ovs-atomic.h"
+#include "llring.h"
 #include "seq-pool.h"
 
 struct seq_node {
@@ -28,21 +29,33 @@ struct seq_node {
 };
 
 #define SEQPOOL_C_SIZE 32
-#define SEQPOOL_C_MASKED(u) (u & (SEQPOOL_C_SIZE - 1))
-#define SEQPOOL_C_EMPTY(c) ((c)->head == (c)->tail)
-#define SEQPOOL_C_FULL(c) (!SEQPOOL_C_EMPTY(c) \
-                      && SEQPOOL_C_MASKED((c)->head) \
-                      == SEQPOOL_C_MASKED((c)->tail))
-#define SEQPOOL_C_ADD(c, u) do { (c)->ids[SEQPOOL_C_MASKED((c)->head++)] = u; } while(0)
-#define SEQPOOL_C_POP(c) ((c)->ids[SEQPOOL_C_MASKED((c)->tail++)])
 BUILD_ASSERT_DECL(IS_POW2(SEQPOOL_C_SIZE));
 
 struct seq_pool_cache {
-    struct ovs_mutex c_lock;
-    uint32_t head;
-    uint32_t tail;
-    uint32_t ids[SEQPOOL_C_SIZE];
+    struct llring ring;
+    struct llring_node ids[SEQPOOL_C_SIZE];
 };
+
+static bool
+seq_pool_c_add(struct seq_pool_cache *c, uint32_t id)
+{
+    union llring_data data = { .u32 = id };
+
+    return llring_enqueue(&c->ring, data);
+}
+
+static bool
+seq_pool_c_pop(struct seq_pool_cache *c, uint32_t *id)
+{
+    union llring_data data;
+
+    if (llring_dequeue(&c->ring, &data)) {
+        *id = data.u32;
+        return true;
+    }
+
+    return false;
+}
 
 struct seq_pool {
     uint32_t next_id;
@@ -67,7 +80,8 @@ seq_pool_create(unsigned int nb_user, uint32_t base, uint32_t n_ids)
 
     pool->cache = xcalloc(nb_user, sizeof *pool->cache);
     for (i = 0; i < nb_user; i++) {
-        ovs_mutex_init(&pool->cache[i].c_lock);
+        ovs_assert(llring_init(&pool->cache[i].ring,
+                               pool->cache[i].ids, SEQPOOL_C_SIZE) == 0);
     }
     pool->nb_user = nb_user;
 
@@ -86,7 +100,6 @@ seq_pool_destroy(struct seq_pool *pool)
 {
     struct seq_node *node;
     struct seq_node *next;
-    size_t i;
 
     if (!pool) {
         return;
@@ -100,14 +113,6 @@ seq_pool_destroy(struct seq_pool *pool)
     ovs_mutex_unlock(&pool->lock);
     ovs_mutex_destroy(&pool->lock);
 
-    for (i = 0; i < pool->nb_user; i++) {
-        ovs_mutex_lock(&pool->cache[i].c_lock);
-        pool->cache[i].head = 0;
-        pool->cache[i].tail = 0;
-        ovs_mutex_unlock(&pool->cache[i].c_lock);
-        ovs_mutex_destroy(&pool->cache[i].c_lock);
-    }
-
     free(pool->cache);
     free(pool);
 }
@@ -116,83 +121,61 @@ bool
 seq_pool_new_id(struct seq_pool *pool, unsigned int uid, uint32_t *id)
 {
     struct seq_pool_cache *cache;
+    struct ovs_list *front;
     struct seq_node *node;
-    bool found = false;
 
     uid %= pool->nb_user;
     cache = &pool->cache[uid];
 
-    ovs_mutex_lock(&cache->c_lock);
-
-    if (!SEQPOOL_C_EMPTY(cache)) {
-        *id = SEQPOOL_C_POP(cache);
-        found = true;
-        goto unlock;
+    if (seq_pool_c_pop(cache, id)) {
+        return true;
     }
 
     ovs_mutex_lock(&pool->lock);
 
-    while (!SEQPOOL_C_FULL(cache)
-        && !ovs_list_is_empty(&pool->free_ids)) {
-        node = CONTAINER_OF(ovs_list_pop_front(&pool->free_ids),
-                            struct seq_node, list_node);
-        SEQPOOL_C_ADD(cache, node->id);
-        free(node);
+    while (!ovs_list_is_empty(&pool->free_ids)) {
+        front = ovs_list_front(&pool->free_ids);
+        node = CONTAINER_OF(front, struct seq_node, list_node);
+        if (seq_pool_c_add(cache, node->id)) {
+            ovs_list_remove(front);
+            free(node);
+        } else {
+            break;
+        }
     }
 
-    while (!SEQPOOL_C_FULL(cache)
-        && pool->next_id < pool->base + pool->n_ids) {
-        SEQPOOL_C_ADD(cache, pool->next_id++);
+    while (pool->next_id < pool->base + pool->n_ids) {
+        if (seq_pool_c_add(cache, pool->next_id)) {
+            pool->next_id++;
+        } else {
+            break;
+        }
     }
 
     ovs_mutex_unlock(&pool->lock);
 
-    if (SEQPOOL_C_EMPTY(cache)) {
+    if (seq_pool_c_pop(cache, id)) {
+        return true;
+    } else {
         struct seq_pool_cache *c2;
         size_t i;
 
+        /* If no ID was available either from shared counter,
+         * free-list or local cache, steal an ID from another
+         * user cache.
+         */
         for (i = 0; i < pool->nb_user; i++) {
             if (i == uid) {
                 continue;
             }
             c2 = &pool->cache[i];
-            /* Danger zone!
-             * c2's user could also be attempting to steal from other
-             * user's cache at the same time. In such case, it would check
-             * 'uid' cache as well, which is locked.
-             *
-             * Locking c2->c_lock would thus lead to deadlock.
-             *
-             * First incomplete mitigation is to avoid locking on empty caches.
-             */
-            if (SEQPOOL_C_EMPTY(c2)) {
-                continue;
+            if (seq_pool_c_pop(c2, id)) {
+                return true;
             }
-            /* Nothing prevents 'uid' thread to be suspended here, and for
-             * 'c2' user to empty its cache and attempt a new alloc, bringing back
-             * the same deadlock as before.
-             *
-             * So only try to lock the cache lock. This means that in some situation,
-             * there will be some IDs remaining in the pool but allocation will fail.
-             */
-            if (ovs_mutex_trylock(&c2->c_lock)) {
-                continue;
-            }
-            if (!SEQPOOL_C_EMPTY(c2)) {
-                SEQPOOL_C_ADD(cache, SEQPOOL_C_POP(c2));
-            }
-            ovs_mutex_unlock(&c2->c_lock);
         }
     }
 
-    if (!SEQPOOL_C_EMPTY(cache)) {
-        *id = SEQPOOL_C_POP(cache);
-        found = true;
-    }
-
-unlock:
-    ovs_mutex_unlock(&cache->c_lock);
-    return found;
+    return false;
 }
 
 void
@@ -209,11 +192,7 @@ seq_pool_free_id(struct seq_pool *pool, unsigned int uid, uint32_t id)
     uid %= pool->nb_user;
     cache = &pool->cache[uid];
 
-    ovs_mutex_lock(&cache->c_lock);
-
-    if (!SEQPOOL_C_FULL(cache)) {
-        SEQPOOL_C_ADD(cache, id);
-        ovs_mutex_unlock(&cache->c_lock);
+    if (seq_pool_c_add(cache, id)) {
         return;
     }
 
@@ -221,9 +200,9 @@ seq_pool_free_id(struct seq_pool *pool, unsigned int uid, uint32_t id)
     memset(nodes, 0, sizeof(nodes));
 
     /* Flush the cache. */
-    while (!SEQPOOL_C_EMPTY(cache)) {
+    while (seq_pool_c_pop(cache, &node_id)) {
         nodes[i] = xmalloc(sizeof **nodes);
-        nodes[i]->id = SEQPOOL_C_POP(cache);
+        nodes[i]->id = node_id;
         i++;
     }
 
@@ -239,6 +218,4 @@ seq_pool_free_id(struct seq_pool *pool, unsigned int uid, uint32_t id)
         i++;
     }
     ovs_mutex_unlock(&pool->lock);
-
-    ovs_mutex_unlock(&cache->c_lock);
 }
