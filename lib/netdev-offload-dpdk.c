@@ -37,9 +37,6 @@ static struct vlog_rate_limit rl = VLOG_RATE_LIMIT_INIT(100, 5);
  *
  * Below API is NOT thread safe in following terms:
  *
- *  - The caller must be sure that none of these functions will be called
- *    simultaneously.  Even for different 'netdev's.
- *
  *  - The caller must be sure that 'netdev' will not be destructed/deallocated.
  *
  *  - The caller must be sure that 'netdev' configuration will not be changed.
@@ -49,10 +46,14 @@ static struct vlog_rate_limit rl = VLOG_RATE_LIMIT_INIT(100, 5);
  * For current implementation all above restrictions could be fulfilled by
  * taking the datapath 'port_mutex' in lib/dpif-netdev.c.  */
 
+/* Protects 'ufid_to_rte_flow' write access. */
+static struct ovs_mutex ufid_to_rte_flow_mutex = OVS_MUTEX_INITIALIZER;
+
 /*
  * A mapping from ufid to dpdk rte_flow.
  */
-static struct cmap ufid_to_rte_flow = CMAP_INITIALIZER;
+static struct cmap ufid_to_rte_flow OVS_GUARDED_BY(ufid_to_rte_flow_mutex)
+    = CMAP_INITIALIZER;
 
 struct ufid_to_rte_flow_data {
     struct cmap_node node;
@@ -78,6 +79,23 @@ ufid_to_rte_flow_data_find(const ovs_u128 *ufid)
     return NULL;
 }
 
+/* Find rte_flow with @ufid, lock-protected. */
+static struct ufid_to_rte_flow_data *
+ufid_to_rte_flow_data_find_protected(const ovs_u128 *ufid)
+    OVS_REQUIRES(ufid_to_rte_flow_mutex)
+{
+    size_t hash = hash_bytes(ufid, sizeof *ufid, 0);
+    struct ufid_to_rte_flow_data *data;
+
+    CMAP_FOR_EACH_WITH_HASH_PROTECTED (data, node, hash, &ufid_to_rte_flow) {
+        if (ovs_u128_equals(*ufid, data->ufid)) {
+            return data;
+        }
+    }
+
+    return NULL;
+}
+
 static inline void
 ufid_to_rte_flow_associate(const ovs_u128 *ufid,
                            struct rte_flow *rte_flow, bool actions_offloaded)
@@ -86,13 +104,15 @@ ufid_to_rte_flow_associate(const ovs_u128 *ufid,
     struct ufid_to_rte_flow_data *data = xzalloc(sizeof *data);
     struct ufid_to_rte_flow_data *data_prev;
 
+    ovs_mutex_lock(&ufid_to_rte_flow_mutex);
+
     /*
      * We should not simply overwrite an existing rte flow.
      * We should have deleted it first before re-adding it.
      * Thus, if following assert triggers, something is wrong:
      * the rte_flow is not destroyed.
      */
-    data_prev = ufid_to_rte_flow_data_find(ufid);
+    data_prev = ufid_to_rte_flow_data_find_protected(ufid);
     if (data_prev) {
         ovs_assert(data_prev->rte_flow == NULL);
     }
@@ -103,6 +123,8 @@ ufid_to_rte_flow_associate(const ovs_u128 *ufid,
 
     cmap_insert(&ufid_to_rte_flow,
                 CONST_CAST(struct cmap_node *, &data->node), hash);
+
+    ovs_mutex_unlock(&ufid_to_rte_flow_mutex);
 }
 
 static inline void
@@ -111,17 +133,19 @@ ufid_to_rte_flow_disassociate(const ovs_u128 *ufid)
     size_t hash = hash_bytes(ufid, sizeof *ufid, 0);
     struct ufid_to_rte_flow_data *data;
 
-    CMAP_FOR_EACH_WITH_HASH (data, node, hash, &ufid_to_rte_flow) {
-        if (ovs_u128_equals(*ufid, data->ufid)) {
-            cmap_remove(&ufid_to_rte_flow,
-                        CONST_CAST(struct cmap_node *, &data->node), hash);
-            ovsrcu_postpone(free, data);
-            return;
-        }
-    }
+    ovs_mutex_lock(&ufid_to_rte_flow_mutex);
 
-    VLOG_WARN("ufid "UUID_FMT" is not associated with an rte flow",
-              UUID_ARGS((struct uuid *) ufid));
+    data = ufid_to_rte_flow_data_find_protected(ufid);
+    if (data) {
+        cmap_remove(&ufid_to_rte_flow,
+                    CONST_CAST(struct cmap_node *, &data->node), hash);
+        ovsrcu_postpone(free, data);
+        ovs_mutex_unlock(&ufid_to_rte_flow_mutex);
+    } else {
+        ovs_mutex_unlock(&ufid_to_rte_flow_mutex);
+        VLOG_WARN("ufid "UUID_FMT" is not associated with an rte flow",
+                  UUID_ARGS((struct uuid *) ufid));
+    }
 }
 
 /*
