@@ -37,9 +37,6 @@ static struct vlog_rate_limit rl = VLOG_RATE_LIMIT_INIT(100, 5);
  *
  * Below API is NOT thread safe in following terms:
  *
- *  - The caller must be sure that none of these functions will be called
- *    simultaneously.  Even for different 'netdev's.
- *
  *  - The caller must be sure that 'netdev' will not be destructed/deallocated.
  *
  *  - The caller must be sure that 'netdev' configuration will not be changed.
@@ -64,6 +61,7 @@ struct ufid_to_rte_flow_data {
 struct netdev_offload_dpdk_data {
     struct cmap ufid_to_rte_flow;
     uint64_t *rte_flow_counters;
+    struct ovs_mutex map_lock;
 };
 
 static int
@@ -72,6 +70,7 @@ offload_data_init(struct netdev *netdev)
     struct netdev_offload_dpdk_data *data;
 
     data = xzalloc(sizeof *data);
+    ovs_mutex_init(&data->map_lock);
     cmap_init(&data->ufid_to_rte_flow);
     data->rte_flow_counters = xcalloc(netdev_offload_thread_nb(),
                                       sizeof *data->rte_flow_counters);
@@ -97,10 +96,31 @@ offload_data_destroy(struct netdev *netdev)
     }
 
     cmap_destroy(&data->ufid_to_rte_flow);
+    ovs_mutex_destroy(&data->map_lock);
     free(data->rte_flow_counters);
     free(data);
 
     netdev->hw_info.offload_data = NULL;
+}
+
+static void
+offload_data_lock(struct netdev *netdev)
+    OVS_NO_THREAD_SAFETY_ANALYSIS
+{
+    struct netdev_offload_dpdk_data *data;
+
+    data = netdev->hw_info.offload_data;
+    ovs_mutex_lock(&data->map_lock);
+}
+
+static void
+offload_data_unlock(struct netdev *netdev)
+    OVS_NO_THREAD_SAFETY_ANALYSIS
+{
+    struct netdev_offload_dpdk_data *data;
+
+    data = netdev->hw_info.offload_data;
+    ovs_mutex_unlock(&data->map_lock);
 }
 
 static struct cmap *
@@ -130,6 +150,24 @@ ufid_to_rte_flow_data_find(struct netdev *netdev,
     return NULL;
 }
 
+/* Find rte_flow with @ufid, lock-protected. */
+static struct ufid_to_rte_flow_data *
+ufid_to_rte_flow_data_find_protected(struct netdev *netdev,
+                                     const ovs_u128 *ufid)
+{
+    size_t hash = hash_bytes(ufid, sizeof *ufid, 0);
+    struct ufid_to_rte_flow_data *data;
+    struct cmap *map = offload_data_map(netdev);
+
+    CMAP_FOR_EACH_WITH_HASH_PROTECTED (data, node, hash, map) {
+        if (ovs_u128_equals(*ufid, data->ufid)) {
+            return data;
+        }
+    }
+
+    return NULL;
+}
+
 static inline struct ufid_to_rte_flow_data *
 ufid_to_rte_flow_associate(struct netdev *netdev, const ovs_u128 *ufid,
                            struct rte_flow *rte_flow, bool actions_offloaded)
@@ -139,13 +177,15 @@ ufid_to_rte_flow_associate(struct netdev *netdev, const ovs_u128 *ufid,
     struct ufid_to_rte_flow_data *data_prev;
     struct cmap *map = offload_data_map(netdev);
 
+    offload_data_lock(netdev);
+
     /*
      * We should not simply overwrite an existing rte flow.
      * We should have deleted it first before re-adding it.
      * Thus, if following assert triggers, something is wrong:
      * the rte_flow is not destroyed.
      */
-    data_prev = ufid_to_rte_flow_data_find(netdev, ufid);
+    data_prev = ufid_to_rte_flow_data_find_protected(netdev, ufid);
     if (data_prev) {
         ovs_assert(data_prev->rte_flow == NULL);
     }
@@ -155,6 +195,9 @@ ufid_to_rte_flow_associate(struct netdev *netdev, const ovs_u128 *ufid,
     data->actions_offloaded = actions_offloaded;
 
     cmap_insert(map, CONST_CAST(struct cmap_node *, &data->node), hash);
+
+    offload_data_unlock(netdev);
+
     return data;
 }
 
@@ -163,20 +206,25 @@ ufid_to_rte_flow_disassociate(struct netdev *netdev,
                               const ovs_u128 *ufid)
 {
     struct cmap *map = offload_data_map(netdev);
-    size_t hash = hash_bytes(ufid, sizeof *ufid, 0);
     struct ufid_to_rte_flow_data *data;
+    size_t hash;
 
-    CMAP_FOR_EACH_WITH_HASH (data, node, hash, map) {
-        if (ovs_u128_equals(*ufid, data->ufid)) {
-            cmap_remove(map, CONST_CAST(struct cmap_node *, &data->node),
-                        hash);
-            ovsrcu_postpone(free, data);
-            return;
-        }
+    offload_data_lock(netdev);
+
+    data = ufid_to_rte_flow_data_find_protected(netdev, ufid);
+    if (!data) {
+        offload_data_unlock(netdev);
+        VLOG_WARN("ufid "UUID_FMT" is not associated with an rte flow",
+                  UUID_ARGS((struct uuid *) ufid));
+        return;
     }
+    hash = hash_bytes(ufid, sizeof *ufid, 0);
+    cmap_remove(map, CONST_CAST(struct cmap_node *, &data->node),
+                hash);
 
-    VLOG_WARN("ufid "UUID_FMT" is not associated with an rte flow",
-              UUID_ARGS((struct uuid *) ufid));
+    offload_data_unlock(netdev);
+
+    ovsrcu_postpone(free, data);
 }
 
 /*
