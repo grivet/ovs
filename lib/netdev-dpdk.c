@@ -5201,6 +5201,15 @@ netdev_dpdk_rte_flow_destroy(OVS_UNUSED struct netdev *netdev,
     return 0;
 }
 
+static void
+artificial_slow_down(void)
+{
+    long long int now = time_usec();
+
+    /* slow down process to simulate 65K/s HW insert. */
+    while (time_usec() < now + 13);
+}
+
 struct rte_flow *
 netdev_dpdk_rte_flow_create(OVS_UNUSED struct netdev *netdev,
                             OVS_UNUSED const struct rte_flow_attr *attr,
@@ -5210,6 +5219,8 @@ netdev_dpdk_rte_flow_create(OVS_UNUSED struct netdev *netdev,
 {
     struct netdev_dpdk *dev = netdev_dpdk_cast(netdev);
     unsigned int tid = netdev_offload_thread_id();
+
+    artificial_slow_down();
 
     dev->sw_stats->hw_offloads[tid]++;
     return (struct rte_flow *)0xdeadbeef;
