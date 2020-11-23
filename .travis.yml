@@ -31,7 +31,7 @@ addons:
       - python3-wheel
       - ninja-build
 
-before_install: ./.travis/${TRAVIS_OS_NAME}-prepare.sh
+before_install: ./.ci/${TRAVIS_OS_NAME}-prepare.sh
 
 before_script:
   - export PATH=$PATH:$HOME/bin
@@ -85,7 +85,7 @@ matrix:
             - devscripts
             - equivs
 
-script: ./.travis/${TRAVIS_OS_NAME}-build.sh $OPTS
+script: ./.ci/${TRAVIS_OS_NAME}-build.sh $OPTS
 
 notifications:
   email:
