@@ -2735,15 +2735,20 @@ err_free:
     return -1;
 }
 
+#define DP_NETDEV_OFFLOAD_QUIESCE_INTERVAL_US (10 * 1000) /* 10 ms */
+
 static void *
 dp_netdev_flow_offload_main(void *data OVS_UNUSED)
 {
     struct dp_offload_thread_item *offload;
     struct ovs_list *list;
     long long int latency_us;
+    long long int next_rcu;
+    long long int now;
     const char *op;
     int ret;
 
+    next_rcu = time_usec() + DP_NETDEV_OFFLOAD_QUIESCE_INTERVAL_US;
     for (;;) {
         ovs_mutex_lock(&dp_offload_thread.mutex);
         if (ovs_list_is_empty(&dp_offload_thread.list)) {
@@ -2751,6 +2756,7 @@ dp_netdev_flow_offload_main(void *data OVS_UNUSED)
             ovs_mutex_cond_wait(&dp_offload_thread.cond,
                                 &dp_offload_thread.mutex);
             ovsrcu_quiesce_end();
+            next_rcu = time_usec() + DP_NETDEV_OFFLOAD_QUIESCE_INTERVAL_US;
         }
         list = ovs_list_pop_front(&dp_offload_thread.list);
         dp_offload_thread.enqueued_item--;
@@ -2774,14 +2780,22 @@ dp_netdev_flow_offload_main(void *data OVS_UNUSED)
             OVS_NOT_REACHED();
         }
 
-        latency_us = time_usec() - offload->timestamp;
+        now = time_usec();
+
+        latency_us = now - offload->timestamp;
         mov_avg_ema_update(&dp_offload_thread.ema, latency_us);
 
         VLOG_DBG("%s to %s netdev flow "UUID_FMT,
                  ret == 0 ? "succeed" : "failed", op,
                  UUID_ARGS((struct uuid *) &offload->flow->mega_ufid));
         dp_netdev_free_flow_offload(offload);
-        ovsrcu_quiesce();
+
+        /* Do RCU synchronization at fixed interval. */
+        if (now > next_rcu) {
+            if (!ovsrcu_try_quiesce()) {
+                next_rcu += DP_NETDEV_OFFLOAD_QUIESCE_INTERVAL_US;
+            }
+        }
     }
 
     return NULL;
