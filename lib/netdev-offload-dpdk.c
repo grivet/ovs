@@ -63,7 +63,7 @@ struct ufid_to_rte_flow_data {
 
 struct netdev_offload_dpdk_data {
     struct cmap ufid_to_rte_flow;
-    uint64_t rte_flow_counter;
+    uint64_t *rte_flow_counters;
 };
 
 static int
@@ -73,6 +73,8 @@ offload_data_init(struct netdev *netdev)
 
     data = xzalloc(sizeof *data);
     cmap_init(&data->ufid_to_rte_flow);
+    data->rte_flow_counters = xcalloc(netdev_offload_thread_nb(),
+                                      sizeof *data->rte_flow_counters);
 
     netdev->hw_info.offload_data = data;
 
@@ -95,6 +97,7 @@ offload_data_destroy(struct netdev *netdev)
     }
 
     cmap_destroy(&data->ufid_to_rte_flow);
+    free(data->rte_flow_counters);
     free(data);
 
     netdev->hw_info.offload_data = NULL;
@@ -620,9 +623,10 @@ netdev_offload_dpdk_flow_create(struct netdev *netdev,
     flow = netdev_dpdk_rte_flow_create(netdev, attr, items, actions, error);
     if (flow) {
         struct netdev_offload_dpdk_data *data;
+        unsigned int tid = netdev_offload_thread_id();
 
         data = netdev->hw_info.offload_data;
-        data->rte_flow_counter++;
+        data->rte_flow_counters[tid]++;
         if (!VLOG_DROP_DBG(&rl)) {
             dump_flow(&s, &s_extra, attr, items, actions);
             extra_str = ds_cstr(&s_extra);
@@ -1510,9 +1514,10 @@ netdev_offload_dpdk_destroy_flow(struct netdev *netdev,
 
     if (ret == 0) {
         struct netdev_offload_dpdk_data *data;
+        unsigned int tid = netdev_offload_thread_id();
 
         data = netdev->hw_info.offload_data;
-        data->rte_flow_counter--;
+        data->rte_flow_counters[tid]--;
 
         ufid_to_rte_flow_disassociate(netdev, ufid);
         VLOG_DBG_RL(&rl, "%s: rte_flow 0x%"PRIxPTR
@@ -1659,9 +1664,12 @@ netdev_offload_dpdk_hw_offload_stats_get(struct netdev *netdev,
                                          uint64_t *counters)
 {
     struct netdev_offload_dpdk_data *data;
+    unsigned int tid;
 
     data = netdev->hw_info.offload_data;
-    *counters = data->rte_flow_counter;
+    for (tid = 0; tid < netdev_offload_thread_nb(); tid++) {
+        counters[tid] = data->rte_flow_counters[tid];
+    }
     return 0;
 }
 
