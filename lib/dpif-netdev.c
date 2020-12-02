@@ -51,6 +51,7 @@
 #include "hmapx.h"
 #include "id-pool.h"
 #include "ipf.h"
+#include "mov-avg.h"
 #include "netdev.h"
 #include "netdev-offload.h"
 #include "netdev-provider.h"
@@ -428,6 +429,7 @@ struct dp_offload_thread_item {
     struct match match;
     struct nlattr *actions;
     size_t actions_len;
+    long long int timestamp;
 
     struct ovs_list node;
 };
@@ -436,13 +438,17 @@ struct dp_offload_thread {
     struct ovs_mutex mutex;
     struct ovs_list list;
     uint64_t enqueued_item;
+    struct mov_avg_ema ema;
     pthread_cond_t cond;
 };
+
+#define DP_NETDEV_OFFLOAD_EMA_N (10)
 
 static struct dp_offload_thread dp_offload_thread = {
     .mutex = OVS_MUTEX_INITIALIZER,
     .list  = OVS_LIST_INITIALIZER(&dp_offload_thread.list),
     .enqueued_item = 0,
+    .ema = MOV_AVG_EMA_INITIALIZER(DP_NETDEV_OFFLOAD_EMA_N),
 };
 
 static struct ovsthread_once offload_thread_once
@@ -2734,6 +2740,7 @@ dp_netdev_flow_offload_main(void *data OVS_UNUSED)
 {
     struct dp_offload_thread_item *offload;
     struct ovs_list *list;
+    long long int latency_us;
     const char *op;
     int ret;
 
@@ -2767,6 +2774,9 @@ dp_netdev_flow_offload_main(void *data OVS_UNUSED)
             OVS_NOT_REACHED();
         }
 
+        latency_us = time_usec() - offload->timestamp;
+        mov_avg_ema_update(&dp_offload_thread.ema, latency_us);
+
         VLOG_DBG("%s to %s netdev flow "UUID_FMT,
                  ret == 0 ? "succeed" : "failed", op,
                  UUID_ARGS((struct uuid *) &offload->flow->mega_ufid));
@@ -2791,6 +2801,7 @@ queue_netdev_flow_del(struct dp_netdev_pmd_thread *pmd,
 
     offload = dp_netdev_alloc_flow_offload(pmd, flow,
                                            DP_NETDEV_FLOW_OFFLOAD_OP_DEL);
+    offload->timestamp = pmd->ctx.now;
     dp_netdev_append_flow_offload(offload);
 }
 
@@ -2823,6 +2834,7 @@ queue_netdev_flow_put(struct dp_netdev_pmd_thread *pmd,
     memcpy(offload->actions, actions, actions_len);
     offload->actions_len = actions_len;
 
+    offload->timestamp = pmd->ctx.now;
     dp_netdev_append_flow_offload(offload);
 }
 
@@ -4206,10 +4218,12 @@ dpif_netdev_offload_stats_get(struct dpif *dpif,
     enum {
         DP_NETDEV_HW_OFFLOADS_STATS_ENQUEUED,
         DP_NETDEV_HW_OFFLOADS_STATS_INSERTED,
+        DP_NETDEV_HW_OFFLOADS_STATS_LATENCY_MEAN,
     };
     const char *names[] = {
-        [DP_NETDEV_HW_OFFLOADS_STATS_ENQUEUED] = "Enqueued offloads",
-        [DP_NETDEV_HW_OFFLOADS_STATS_INSERTED] = "Inserted offloads",
+        [DP_NETDEV_HW_OFFLOADS_STATS_ENQUEUED]     = "    Enqueued offloads",
+        [DP_NETDEV_HW_OFFLOADS_STATS_INSERTED]     = "    Inserted offloads",
+        [DP_NETDEV_HW_OFFLOADS_STATS_LATENCY_MEAN] = " Average latency (us)",
     };
     struct dp_netdev *dp = get_dp_netdev(dpif);
     struct dp_netdev_port *port;
@@ -4239,6 +4253,8 @@ dpif_netdev_offload_stats_get(struct dpif *dpif,
     stats->counters[DP_NETDEV_HW_OFFLOADS_STATS_ENQUEUED].value =
                                                dp_offload_thread.enqueued_item;
     stats->counters[DP_NETDEV_HW_OFFLOADS_STATS_INSERTED].value = nb_offloads;
+    stats->counters[DP_NETDEV_HW_OFFLOADS_STATS_LATENCY_MEAN].value =
+                                           mov_avg_ema(&dp_offload_thread.ema);
 
     for (i = 0; i < ARRAY_SIZE(names); i++) {
         snprintf(stats->counters[i].name, sizeof(stats->counters[i].name),
