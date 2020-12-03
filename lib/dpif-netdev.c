@@ -1780,7 +1780,7 @@ create_dp_netdev(const char *name, const struct dpif_class *class,
     ovs_refcount_init(&dp->ref_cnt);
     atomic_flag_clear(&dp->destroyed);
 
-    ovs_mutex_init_recursive(&dp->port_mutex);
+    ovs_mutex_init(&dp->port_mutex);
     hmap_init(&dp->ports);
     dp->port_seq = seq_create();
     ovs_mutex_init(&dp->bond_mutex);
