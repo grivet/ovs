@@ -143,6 +143,9 @@ function install_dpdk()
     # Install DPDK using prefix.
     DPDK_OPTS="$DPDK_OPTS --prefix=$(pwd)/build"
 
+    # Do not use native arch.
+    DPDK_OPTS="$DPDK_OPTS -Dmachine=default"
+
     CC=gcc meson $DPDK_OPTS build
     ninja -C build
     ninja -C build install
@@ -158,7 +161,7 @@ function install_dpdk()
 function configure_ovs()
 {
     ./boot.sh
-    ./configure CFLAGS="${CFLAGS_FOR_OVS}" $* || { cat config.log; exit 1; }
+    ./configure CFLAGS="${CFLAGS_FOR_OVS}" LIBS="-ldl" $* || { cat config.log; exit 1; }
 }
 
 function build_ovs()
@@ -196,7 +199,7 @@ fi
 
 if [ "$DPDK" ] || [ "$DPDK_SHARED" ]; then
     if [ -z "$DPDK_VER" ]; then
-        DPDK_VER="19.11.2"
+        DPDK_VER="20.11"
     fi
     install_dpdk $DPDK_VER
     if [ "$CC" = "clang" ]; then
